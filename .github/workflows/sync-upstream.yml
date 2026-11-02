@@ -1,0 +1,77 @@
+name: sync-upstream
+
+# Keeps this fork in step with the repository, then builds a release.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    name: Sync fork and build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Merge upstream and trigger release build
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          DEFAULT_TOKEN: ${{ github.token }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          BRANCHES: "nx2 nx2-experimental"
+        run: |
+          set -uo pipefail
+          export GH_TOKEN="$DEFAULT_TOKEN"
+
+          parent=$(gh api "repos/$REPO" --jq '.parent.full_name // empty')
+          if [ -z "$parent" ]; then
+            echo "::error::$REPO is not a fork, so there is no upstream to sync from."
+            exit 1
+          fi
+          echo "Upstream: $parent"
+
+          failed=0
+          for branch in $BRANCHES; do
+            echo "::group::$branch"
+
+            if ! before=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha 2>/dev/null); then
+              echo "Branch $branch does not exist in this fork, skipping."
+              echo "::endgroup::"; continue
+            fi
+            if ! gh api "repos/$parent/branches/$branch" --silent 2>/dev/null; then
+              echo "Branch $branch does not exist upstream, skipping."
+              echo "::endgroup::"; continue
+            fi
+
+            if ! out=$(GH_TOKEN="${SYNC_TOKEN:-$DEFAULT_TOKEN}" \
+                gh api -X POST "repos/$REPO/merge-upstream" -f branch="$branch" 2>&1); then
+              echo "$out"
+              if echo "$out" | grep -qi 'workflow'; then
+                echo "::error::Upstream changed a workflow file. Add a SYNC_TOKEN secret (see the comments at the top of this file), or press 'Sync fork' on the repo page once."
+              else
+                echo "::error::Could not merge upstream into $branch (merge conflict?). Sync it by hand on the repo page."
+              fi
+              failed=1
+              echo "::endgroup::"; continue
+            fi
+
+            after=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha)
+            if [ "$before" = "$after" ]; then
+              echo "$branch is already up to date."
+              echo "::endgroup::"; continue
+            fi
+            echo "$branch moved ${before::7} -> ${after::7}"
+
+            # A push made with the built-in token does not start other workflows, so start the
+            # release build directly. A push made with a personal token starts it by itself.
+            if [ -z "$SYNC_TOKEN" ]; then
+              gh workflow run release-binaries.yml --ref "$branch"
+              echo "Started release-binaries on $branch."
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
